@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from collections import deque
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,7 +6,8 @@ import gymnasium as gym
 import numpy as np
 import tyro
 import random
-from torch.utils.tensorboard.writer import SummaryWriter
+from collections import deque
+# from torch.utils.tensorboard import SummaryWriter
 
 
 @dataclass
@@ -16,9 +16,9 @@ class Args:
     """gym environment id"""
     lr: float = 2.5e-4
     """learning rate"""
-    gamma: float = 0.9
+    gamma: float = 0.99
     """discount factor"""
-    num_episodes: int = 1000
+    num_episodes: int = 500_000
     """number of episodes"""
     max_step: int = 500
     """max_step"""
@@ -26,13 +26,13 @@ class Args:
     """seed number"""
     buffer_limit: int = 50_000
     """max limit for relay buffer"""
-    batch_size: int = 32
+    batch_size: int = 128
     """batch size of sample from relay memory"""
-    epsilon: float = 1
-    """starting epsilon"""
-    epsilon_min: float = 0.01
+    epsilon_max: float = 1.0
+    """max epsilon"""
+    epsilon_min: float = 0.05
     """min epsilon"""
-    epsilon_decay: float = 0.9
+    epsilon_decay: float = 0.5
     """fraction of adjust epsilon"""
     target_update: int = 500
     """the timesteps it takes to update the target network"""
@@ -82,18 +82,24 @@ class DQNAgent:
         action_size,
         lr,
         gamma,
-        epsilon,
+        epsilon_max,
         epsilon_min,
         epsilon_decay,
         buffer_limit,
         batch_size,
         target_update,
     ):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            "mps" if torch.backends.mps.is_available() else self.device
+        )
+
         self.state_size = state_size
         self.action_size = action_size
         self.lr = lr
         self.gamma = gamma
-        self.epsilon = epsilon
+        self.epsilon = epsilon_max
+        self.epsilon_max = epsilon_max
         self.epsilon_min = epsilon_min
         self.epsilon_decay = epsilon_decay
         self.batch_size = batch_size
@@ -116,20 +122,21 @@ class DQNAgent:
         self.t_step += 1
         if len(self.memory) > self.batch_size:
             experiences = self.memory.sample(self.batch_size)
-            loss = self.learn(experiences)
+            self.learn(experiences)
 
         # update target network periodically
         if self.t_step % self.target_update == 0:
             self.target_net.load_state_dict(self.q_net.state_dict())
 
-        return loss
-
-    def act(self, state):
+    def act(self, state, episode):
         """choose action using epsilon-greedy"""
+        self.epsilon = self.epsilon_min + (
+            self.epsilon_max - self.epsilon_min
+        ) * np.exp(-self.epsilon_decay * episode)
         if random.random() < self.epsilon:
             return random.choice(np.arange(self.action_size))
 
-        state = torch.FloatTensor(state).unsqueeze(0)
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         q_values = self.q_net(state)
         return np.argmax(q_values.cpu().data.numpy())
 
@@ -151,11 +158,6 @@ class DQNAgent:
         loss.backward()
         self.optimizer.step()
 
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
-
-        return loss.item()
-
 
 def train(args: Args, log_dir="runs/dqn"):
     env = gym.make(args.env_id)
@@ -167,20 +169,21 @@ def train(args: Args, log_dir="runs/dqn"):
         action_size,
         lr=args.lr,
         gamma=args.gamma,
-        epsilon=args.epsilon,
+        epsilon_max=args.epsilon_max,
         epsilon_min=args.epsilon_min,
         epsilon_decay=args.epsilon_decay,
         buffer_limit=args.buffer_limit,
         batch_size=args.batch_size,
         target_update=args.target_update,
     )
+    print(f"running on {agent.device}")
 
-    writer = SummaryWriter(log_dir)
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s"
-        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
+    # writer = SummaryWriter(log_dir)
+    # writer.add_text(
+    #     "hyperparameters",
+    #     "|param|value|\n|-|-|\n%s"
+    #     % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+    # )
 
     episode_rewards = []
     episode_losses = []
@@ -192,7 +195,7 @@ def train(args: Args, log_dir="runs/dqn"):
         losses = []
 
         for step in range(args.max_step):
-            action = agent.act(state)
+            action = agent.act(state, episode)
             next_state, reward, done, truncated, _ = env.step(action)
 
             done = done or truncated
@@ -209,14 +212,14 @@ def train(args: Args, log_dir="runs/dqn"):
         episode_rewards.append(episode_reward)
 
         # log metrics
-        writer.add_scalar("Episode/Reward", episode_reward, episode)
-        writer.add_scalar("Episode/Epsilon", agent.epsilon, episode)
-        writer.add_scalar("Episode/Steps", step + 1, episode)
+        # writer.add_scalar("Episode/Reward", episode_reward, episode)
+        # writer.add_scalar("Episode/Epsilon", agent.epsilon, episode)
+        # writer.add_scalar("Episode/Steps", step + 1, episode)
 
         if episode_losses:
             avg_loss = np.mean(losses)
             episode_losses.append(avg_loss)
-            writer.add_scalar("Episode/Loss", avg_loss, episode)
+            # writer.add_scalar("Episode/Loss", avg_loss, episode)
 
         if episode % 100 == 0:
             avg_score = np.mean(episode_rewards)
@@ -224,18 +227,14 @@ def train(args: Args, log_dir="runs/dqn"):
                 f"Episode {episode}, Average Score: {avg_score:.2f}, Epsilon: {agent.epsilon:.3f}"
             )
 
-            # Check if solved (for CartPole)
-            if avg_score >= 195.0:
-                print(f"Environment solved in {episode} episodes!")
-                break
-    writer.close()
+    # writer.close()
     env.close()
     return agent
 
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    print(args)
     print(f"Training DQN agent on {args.env_id}")
     train(args)
+
     print("\nTo view training logs, run: tensorboard --logdir=runs")
